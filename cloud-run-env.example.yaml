@@ -1,0 +1,4 @@
+GCP_PROJECT_ID: "project-b084f18e-b822-4878-8b6"
+GCS_BUCKET_NAME: "global-restro"
+MONGODB_URI: "mongodb+srv://USERNAME:PASSWORD@CLUSTER.mongodb.net/restaurant_menu?retryWrites=true&w=majority"
+GEMINI_API_KEY: "YOUR_GEMINI_API_KEY"

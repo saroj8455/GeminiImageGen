@@ -3,9 +3,10 @@ import express from 'express';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import cors from 'cors';
-import multer from 'multer';
+import busboy from 'busboy';
 import sharp from 'sharp';
 import { randomUUID } from 'node:crypto';
+import { http } from '@google-cloud/functions-framework';
 import { Storage } from '@google-cloud/storage';
 import textToSpeech from '@google-cloud/text-to-speech';
 import Menu from './models/Menu.js';
@@ -14,35 +15,104 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
-const imageUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: MAX_IMAGE_SIZE_BYTES,
-    files: 1,
-  },
-}).single('menuItemImage');
-
 const parseImageUpload = (req, res, next) => {
-  imageUpload(req, res, (error) => {
-    if (!error) {
-      return next();
-    }
+  let parser;
 
-    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({
-        success: false,
-        error: 'Image must be 5 MB or smaller',
-      });
-    }
-
+  try {
+    parser = busboy({
+      headers: req.headers,
+      limits: {
+        fileSize: MAX_IMAGE_SIZE_BYTES,
+        files: 1,
+        fields: 10,
+      },
+    });
+  } catch (error) {
     return res.status(400).json({
       success: false,
       error: error.message,
     });
+  }
+
+  const fields = {};
+  let uploadedFile;
+  let uploadError;
+
+  const setUploadError = (status, message) => {
+    if (!uploadError) {
+      uploadError = { status, message };
+    }
+  };
+
+  parser.on('field', (name, value) => {
+    fields[name] = value;
   });
+
+  parser.on('file', (fieldName, fileStream, fileInfo) => {
+    if (fieldName !== 'menuItemImage') {
+      setUploadError(400, 'The image must use the "menuItemImage" form field');
+      fileStream.resume();
+      return;
+    }
+
+    const chunks = [];
+    let size = 0;
+
+    fileStream.on('data', (chunk) => {
+      chunks.push(chunk);
+      size += chunk.length;
+    });
+
+    fileStream.on('limit', () => {
+      setUploadError(413, 'Image must be 5 MB or smaller');
+    });
+
+    fileStream.on('end', () => {
+      if (!uploadError) {
+        uploadedFile = {
+          fieldname: fieldName,
+          originalname: fileInfo.filename,
+          encoding: fileInfo.encoding,
+          mimetype: fileInfo.mimeType,
+          size,
+          buffer: Buffer.concat(chunks),
+        };
+      }
+    });
+  });
+
+  parser.on('filesLimit', () => {
+    setUploadError(400, 'Only one image can be uploaded');
+  });
+
+  parser.on('fieldsLimit', () => {
+    setUploadError(400, 'Too many form fields');
+  });
+
+  parser.on('error', (error) => {
+    setUploadError(400, error.message);
+  });
+
+  parser.on('close', () => {
+    if (uploadError) {
+      return res.status(uploadError.status).json({
+        success: false,
+        error: uploadError.message,
+      });
+    }
+
+    req.body = fields;
+    req.file = uploadedFile;
+    return next();
+  });
+
+  if (Buffer.isBuffer(req.rawBody)) {
+    parser.end(req.rawBody);
+  } else {
+    req.pipe(parser);
+  }
 };
 
 // Initialize Google Cloud Storage using local CLI credentials
@@ -56,10 +126,28 @@ const ttsClient = new textToSpeech.TextToSpeechClient({
   projectId: process.env.GCP_PROJECT_ID,
 });
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch((err) => console.error('MongoDB connection error:', err));
+let mongoConnectionPromise;
+
+const connectToMongo = async () => {
+  if (mongoose.connection.readyState === 1) {
+    return;
+  }
+
+  if (!process.env.MONGODB_URI) {
+    throw new Error('MONGODB_URI is not configured');
+  }
+
+  if (!mongoConnectionPromise) {
+    mongoConnectionPromise = mongoose.connect(process.env.MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000,
+    }).catch((error) => {
+      mongoConnectionPromise = undefined;
+      throw error;
+    });
+  }
+
+  await mongoConnectionPromise;
+};
 
 // Image Upload & WebP Conversion Endpoint
 app.post('/api/upload-image', parseImageUpload, async (req, res) => {
@@ -76,6 +164,16 @@ app.post('/api/upload-image', parseImageUpload, async (req, res) => {
     return res.status(400).json({
       success: false,
       error: 'menuName is required',
+    });
+  }
+
+  try {
+    await connectToMongo();
+  } catch (error) {
+    console.error('MongoDB connection error:', error);
+    return res.status(503).json({
+      success: false,
+      error: 'Unable to connect to MongoDB',
     });
   }
 
@@ -174,10 +272,16 @@ app.post('/api/upload-image', parseImageUpload, async (req, res) => {
 // Image Generation & Upload Endpoint
 app.post('/api/generate-image', async (req, res) => {
   try {
-    const { menuName } = req.body;
+    const menuName = req.body.menuName?.trim();
 
     if (!menuName) {
       return res.status(400).json({ error: 'menuName is required in the payload' });
+    }
+
+    await connectToMongo();
+
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY is not configured');
     }
 
     // 1. Ask Gemini to generate the image
@@ -257,8 +361,13 @@ app.post('/api/generate-image', async (req, res) => {
   }
 });
 
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    success: true,
+    service: 'menuApi',
+  });
 });
+
+http('menuApi', app);
+
+export { app };

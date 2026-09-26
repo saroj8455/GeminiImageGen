@@ -1,3 +1,6 @@
 .env
+.DS_Store
 node_modules/
 uploads/
+cloud-run-menu-api.zip
+cloud-run-env.yaml
